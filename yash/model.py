@@ -194,3 +194,4 @@ def validate_unet_input_size(image_size: int) -> None:
         f"[Input validation] size {image_size} is valid for valid-conv U-Net. "
         f"Encoder path: {' → '.join(map(str, sizes))} → bottleneck {s_bottleneck}"
     )
+    

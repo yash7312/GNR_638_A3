@@ -1,9 +1,23 @@
+import csv
+from pathlib import Path
+
 import torch
 from torch.utils.data import DataLoader, Dataset, Subset, random_split
 
 from losses import SegmentationLoss, dice_score_from_logits, iou_score_from_logits
 from model import UNet, center_crop_2d
 from visualize import save_visual_panel
+
+
+def _append_csv_row(csv_path: str, header: list[str], row: list[object]) -> None:
+    path = Path(csv_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    exists = path.exists()
+    with path.open("a", newline="") as f:
+        writer = csv.writer(f)
+        if not exists:
+            writer.writerow(header)
+        writer.writerow(row)
 
 
 def estimate_foreground_fraction(dataset: Dataset, max_samples: int | None = None) -> float:
@@ -91,6 +105,7 @@ def run_overfit_sanity_check(
     border_sigma: float = 5.0,
     vis_every: int = 20,
     vis_dir: str = "artifacts/overfit",
+    metrics_csv_path: str | None = None,
     dataset: Dataset | None = None,
 ) -> None:
     if dataset is None:
@@ -154,6 +169,13 @@ def run_overfit_sanity_check(
                 f"loss={epoch_loss:.4f} dice={epoch_dice:.4f} iou={epoch_iou:.4f}"
             )
 
+        if metrics_csv_path is not None:
+            _append_csv_row(
+                metrics_csv_path,
+                ["epoch", "loss", "dice", "iou"],
+                [epoch, f"{epoch_loss:.6f}", f"{epoch_dice:.6f}", f"{epoch_iou:.6f}"],
+            )
+
         if epoch == 1 or epoch % vis_every == 0 or epoch == epochs:
             with torch.no_grad():
                 sample_images, sample_masks = next(iter(train_loader))
@@ -180,6 +202,8 @@ def train_with_validation(
     border_sigma: float = 5.0,
     vis_every: int = 5,
     vis_dir: str = "artifacts/train",
+    metrics_csv_path: str | None = None,
+    checkpoint_path: str | None = None,
     dataset: Dataset | None = None,
 ) -> None:
     if dataset is None:
@@ -215,6 +239,8 @@ def train_with_validation(
         f"fg_fraction={fg_fraction:.4f}, pos_weight={use_pos_weight:.2f}"
     )
 
+    best_val_dice = float("-inf")
+
     for epoch in range(1, epochs + 1):
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
         val_loss, val_dice, val_iou = validate(model, val_loader, criterion, device)
@@ -224,6 +250,25 @@ def train_with_validation(
             f"train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
             f"val_dice={val_dice:.4f} val_iou={val_iou:.4f}"
         )
+
+        if metrics_csv_path is not None:
+            _append_csv_row(
+                metrics_csv_path,
+                ["epoch", "train_loss", "val_loss", "val_dice", "val_iou"],
+                [
+                    epoch,
+                    f"{train_loss:.6f}",
+                    f"{val_loss:.6f}",
+                    f"{val_dice:.6f}",
+                    f"{val_iou:.6f}",
+                ],
+            )
+
+        if checkpoint_path is not None and val_dice > best_val_dice:
+            best_val_dice = val_dice
+            ckpt_parent = Path(checkpoint_path).parent
+            ckpt_parent.mkdir(parents=True, exist_ok=True)
+            torch.save(model.state_dict(), checkpoint_path)
 
         if epoch == 1 or epoch % vis_every == 0 or epoch == epochs:
             with torch.no_grad():
@@ -293,17 +338,24 @@ def run_overlap_inference_on_dataset(
     save_dir: str,
     tile_size: int = 572,
     threshold: float = 0.5,
+    max_samples: int | None = None,
 ) -> None:
-    from pathlib import Path
     from PIL import Image
 
     out_dir = Path(save_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     model.eval()
-    for images, names in loader:
+    for sample_idx, (images, names) in enumerate(loader):
+        if max_samples is not None and sample_idx >= max_samples:
+            break
         image = images[0]
         logits = overlap_tile_inference(model, image, tile_size=tile_size)
         prob = torch.sigmoid(logits[0]).detach().cpu().numpy()
         pred = (prob > threshold).astype("uint8") * 255
-        Image.fromarray(pred).save(out_dir / names[0].replace(".tif", "_pred.png"))
+        input_gray = (image[0].detach().cpu().clamp(0.0, 1.0).numpy() * 255.0).astype("uint8")
+        prob_gray = (prob * 255.0).astype("uint8")
+        stem = names[0].replace(".tif", "")
+        Image.fromarray(input_gray).save(out_dir / f"{stem}_input.png")
+        Image.fromarray(prob_gray).save(out_dir / f"{stem}_prob.png")
+        Image.fromarray(pred).save(out_dir / f"{stem}_pred.png")

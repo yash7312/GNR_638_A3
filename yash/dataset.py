@@ -8,7 +8,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from scipy.ndimage import gaussian_filter, map_coordinates
 from torch.utils.data import Dataset
 
 
@@ -23,12 +22,9 @@ def apply_basic_augmentations(
     image: torch.Tensor,
     mask: torch.Tensor,
     rng: torch.Generator | None = None,
-    np_rng: np.random.Generator | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if rng is None:
         rng = torch.Generator()
-    if np_rng is None:
-        np_rng = np.random.default_rng()
 
     if torch.rand(1, generator=rng).item() < 0.5:
         image = torch.flip(image, dims=[2])
@@ -83,60 +79,71 @@ def apply_elastic_deformation(
     alpha: float = 18.0,
     sigma: float = 4.0,
     coarse_grid: int = 3,
-    np_rng: np.random.Generator | None = None,
+    rng: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if np_rng is None:
-        np_rng = np.random.default_rng()
+    if rng is None:
+        rng = torch.Generator(device="cpu")
 
-    c, h, w = image.shape
-    coarse_dx = np_rng.normal(0.0, 1.0, size=(coarse_grid, coarse_grid)).astype(np.float32)
-    coarse_dy = np_rng.normal(0.0, 1.0, size=(coarse_grid, coarse_grid)).astype(np.float32)
+    def _gaussian_kernel2d(s: float, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        radius = max(1, int(3 * s))
+        size = 2 * radius + 1
+        coords = torch.arange(-radius, radius + 1, device=device, dtype=dtype)
+        kernel_1d = torch.exp(-(coords**2) / (2 * s**2))
+        kernel_1d = kernel_1d / kernel_1d.sum()
+        kernel_2d = torch.outer(kernel_1d, kernel_1d)
+        kernel_2d = kernel_2d / kernel_2d.sum()
+        return kernel_2d.view(1, 1, size, size)
 
-    dx = (
-        F.interpolate(
-            torch.from_numpy(coarse_dx).unsqueeze(0).unsqueeze(0),
-            size=(h, w),
-            mode="bicubic",
-            align_corners=False,
-        )
-        .squeeze(0)
-        .squeeze(0)
-        .numpy()
+    def _smooth_field(field: torch.Tensor, s: float) -> torch.Tensor:
+        kernel = _gaussian_kernel2d(s, field.device, field.dtype)
+        pad = kernel.shape[-1] // 2
+        return F.conv2d(field, kernel, padding=pad)
+
+    device = image.device
+    dtype = image.dtype
+    _, h, w = image.shape
+
+    coarse_dx = torch.randn((1, 1, coarse_grid, coarse_grid), generator=rng, dtype=dtype).to(device)
+    coarse_dy = torch.randn((1, 1, coarse_grid, coarse_grid), generator=rng, dtype=dtype).to(device)
+
+    dx = F.interpolate(coarse_dx, size=(h, w), mode="bicubic", align_corners=False)
+    dy = F.interpolate(coarse_dy, size=(h, w), mode="bicubic", align_corners=False)
+
+    dx = _smooth_field(dx, sigma) * alpha
+    dy = _smooth_field(dy, sigma) * alpha
+
+    yy, xx = torch.meshgrid(
+        torch.linspace(-1.0, 1.0, h, device=device, dtype=dtype),
+        torch.linspace(-1.0, 1.0, w, device=device, dtype=dtype),
+        indexing="ij",
     )
-    dy = (
-        F.interpolate(
-            torch.from_numpy(coarse_dy).unsqueeze(0).unsqueeze(0),
-            size=(h, w),
-            mode="bicubic",
-            align_corners=False,
-        )
-        .squeeze(0)
-        .squeeze(0)
-        .numpy()
+
+    dx_norm = dx[0, 0] * (2.0 / max(w - 1, 1))
+    dy_norm = dy[0, 0] * (2.0 / max(h - 1, 1))
+
+    grid = torch.stack([xx + dx_norm, yy + dy_norm], dim=-1).unsqueeze(0)
+
+    image_b = image.unsqueeze(0)
+    mask_b = mask.unsqueeze(0)
+
+    warped_image = F.grid_sample(
+        image_b,
+        grid,
+        mode="bilinear",
+        padding_mode="reflection",
+        align_corners=False,
     )
-    dx = gaussian_filter(dx, sigma=sigma, mode="reflect")
-    dy = gaussian_filter(dy, sigma=sigma, mode="reflect")
+    warped_mask = F.grid_sample(
+        mask_b,
+        grid,
+        mode="nearest",
+        padding_mode="zeros",
+        align_corners=False,
+    )
 
-    dx = dx * alpha
-    dy = dy * alpha
-
-    yy, xx = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")
-    map_y = np.clip(yy + dy, 0, h - 1)
-    map_x = np.clip(xx + dx, 0, w - 1)
-    coords = [map_y, map_x]
-
-    image_np = image.cpu().numpy()
-    out_image = np.zeros_like(image_np)
-    for ch in range(c):
-        out_image[ch] = map_coordinates(image_np[ch], coords, order=1, mode="reflect")
-
-    mask_np = mask[0].cpu().numpy()
-    out_mask = map_coordinates(mask_np, coords, order=0, mode="nearest")
-
-    image_t = torch.from_numpy(out_image).to(dtype=image.dtype)
-    mask_t = torch.from_numpy(out_mask).unsqueeze(0).to(dtype=mask.dtype)
-    mask_t = (mask_t > 0.5).float()
-    return image_t, mask_t
+    warped_image = warped_image.squeeze(0)
+    warped_mask = (warped_mask.squeeze(0) > 0.5).to(mask.dtype)
+    return warped_image, warped_mask
 
 
 class RealCTCSegmentationDataset(Dataset):
@@ -243,9 +250,8 @@ class RealCTCSegmentationDataset(Dataset):
 
             torch_gen = torch.Generator()
             torch_gen.manual_seed(seed)
-            np_rng = np.random.default_rng(seed)
 
-            image, mask = apply_basic_augmentations(image, mask, rng=torch_gen, np_rng=np_rng)
+            image, mask = apply_basic_augmentations(image, mask, rng=torch_gen)
             if torch.rand(1, generator=torch_gen).item() < self.elastic_prob:
                 image, mask = apply_elastic_deformation(
                     image,
@@ -253,7 +259,7 @@ class RealCTCSegmentationDataset(Dataset):
                     alpha=self.elastic_alpha,
                     sigma=self.elastic_sigma,
                     coarse_grid=self.elastic_grid,
-                    np_rng=np_rng,
+                    rng=torch_gen,
                 )
         return image, mask
 
