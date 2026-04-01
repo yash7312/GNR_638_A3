@@ -1,7 +1,6 @@
 import os
 
 import torch
-import torch.nn.functional as F
 from PIL import Image
 
 from model import center_crop_2d
@@ -19,12 +18,7 @@ def save_visual_panel(
 
     image = images[0].detach().cpu().clamp(0.0, 1.0)
     target_h, target_w = logits.shape[2], logits.shape[3]
-    image = F.interpolate(
-        image.unsqueeze(0),
-        size=(target_h, target_w),
-        mode="bilinear",
-        align_corners=False,
-    ).squeeze(0)
+    image = center_crop_2d(image.unsqueeze(0), target_h, target_w).squeeze(0)
 
     masks = center_crop_2d(masks, target_h, target_w)
     mask = masks[0, 0].detach().cpu().clamp(0.0, 1.0)

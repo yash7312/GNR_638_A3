@@ -2,9 +2,6 @@ import torch
 import torch.nn as nn
 
 
-MIN_UNET_INPUT_SIZE = 188
-
-
 def center_crop_2d(x: torch.Tensor, target_h: int, target_w: int) -> torch.Tensor:
     _, _, h, w = x.shape
     if target_h > h or target_w > w:
@@ -148,8 +145,52 @@ class UNet(nn.Module):
 
 
 def validate_unet_input_size(image_size: int) -> None:
-    if image_size < MIN_UNET_INPUT_SIZE:
+    """
+    Validate input size for valid-convolution U-Net.
+
+    Applies the recurrence relation for each encoder stage:
+        s_{i+1} = (s_i - 4) / 2
+    
+    where two 3x3 valid convs reduce by 4, and 2x2 maxpool halves the result.
+    
+    All intermediate sizes must be positive integers.
+    Bottleneck must also satisfy: s_bottleneck = s_4 - 4 > 0
+    
+    Args:
+        image_size: Input spatial dimension (assumed square).
+        
+    Raises:
+        ValueError: If any constraint is violated.
+    """
+    s = image_size
+    
+    # Encoder stages: 4 down blocks
+    sizes = [s]
+    for level in range(1, 5):
+        # Two valid convs reduce by 4, then maxpool halves
+        if (s - 4) % 2 != 0:
+            raise ValueError(
+                f"At encoder level {level}: size {s} → ({s} - 4) / 2 is not an integer. "
+                f"({s} - 4) = {s - 4} must be even."
+            )
+        s = (s - 4) // 2
+        if s <= 0:
+            raise ValueError(
+                f"At encoder level {level}: size becomes non-positive ({s}). "
+                f"Input size {image_size} is too small."
+            )
+        sizes.append(s)
+    
+    # Bottleneck: two more valid convs without pooling
+    s_bottleneck = s - 4
+    if s_bottleneck <= 0:
         raise ValueError(
-            f"image_size={image_size} is too small for this valid-convolution U-Net. "
-            f"Use image_size >= {MIN_UNET_INPUT_SIZE}."
+            f"Bottleneck size {s_bottleneck} is non-positive. "
+            f"Input size {image_size} is too small."
         )
+    
+    # All constraints passed
+    print(
+        f"[Input validation] size {image_size} is valid for valid-conv U-Net. "
+        f"Encoder path: {' → '.join(map(str, sizes))} → bottleneck {s_bottleneck}"
+    )

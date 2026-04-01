@@ -1,7 +1,6 @@
 import torch
 from torch.utils.data import DataLoader, Dataset, Subset, random_split
 
-from dataset import SyntheticShapesDataset
 from losses import SegmentationLoss, dice_score_from_logits, iou_score_from_logits
 from model import UNet, center_crop_2d
 from visualize import save_visual_panel
@@ -87,16 +86,17 @@ def run_overfit_sanity_check(
     loss_mode: str = "bce_dice",
     dice_lambda: float = 0.5,
     pos_weight: float | None = None,
+    use_border_weights: bool = False,
+    border_w0: float = 10.0,
+    border_sigma: float = 5.0,
     vis_every: int = 20,
     vis_dir: str = "artifacts/overfit",
+    dataset: Dataset | None = None,
 ) -> None:
-    dataset = SyntheticShapesDataset(
-        num_samples=max(20, tiny_samples),
-        image_size=image_size,
-        in_channels=in_channels,
-        augment=False,
-    )
-    tiny_subset = Subset(dataset, list(range(tiny_samples)))
+    if dataset is None:
+        raise ValueError("run_overfit_sanity_check requires a real dataset instance.")
+    tiny_n = min(tiny_samples, len(dataset))
+    tiny_subset = Subset(dataset, list(range(tiny_n)))
     train_loader = DataLoader(tiny_subset, batch_size=batch_size, shuffle=True)
 
     img0, mask0 = dataset[0]
@@ -106,7 +106,14 @@ def run_overfit_sanity_check(
     fg_fraction = estimate_foreground_fraction(tiny_subset)
     auto_pos_weight = (1.0 - fg_fraction) / max(fg_fraction, 1e-6)
     use_pos_weight = auto_pos_weight if pos_weight is None else pos_weight
-    criterion = SegmentationLoss(mode=loss_mode, dice_lambda=dice_lambda, pos_weight=use_pos_weight).to(device)
+    criterion = SegmentationLoss(
+        mode=loss_mode,
+        dice_lambda=dice_lambda,
+        pos_weight=use_pos_weight,
+        use_border_weights=use_border_weights,
+        border_w0=border_w0,
+        border_sigma=border_sigma,
+    ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     print(
@@ -114,7 +121,7 @@ def run_overfit_sanity_check(
         f"fg_fraction={fg_fraction:.4f}, pos_weight={use_pos_weight:.2f}"
     )
 
-    print(f"[Sanity] Overfitting on {tiny_samples} samples for {epochs} epochs...")
+    print(f"[Sanity] Overfitting on {tiny_n} samples for {epochs} epochs...")
     for epoch in range(1, epochs + 1):
         model.train()
         epoch_loss = 0.0
@@ -160,7 +167,6 @@ def train_with_validation(
     device: torch.device,
     in_channels: int = 3,
     num_classes: int = 1,
-    num_samples: int = 120,
     image_size: int = 256,
     batch_size: int = 8,
     epochs: int = 30,
@@ -168,17 +174,16 @@ def train_with_validation(
     val_ratio: float = 0.2,
     loss_mode: str = "bce_dice",
     dice_lambda: float = 0.5,
-    use_augmentation: bool = True,
     pos_weight: float | None = None,
+    use_border_weights: bool = False,
+    border_w0: float = 10.0,
+    border_sigma: float = 5.0,
     vis_every: int = 5,
     vis_dir: str = "artifacts/train",
+    dataset: Dataset | None = None,
 ) -> None:
-    dataset = SyntheticShapesDataset(
-        num_samples=num_samples,
-        image_size=image_size,
-        in_channels=in_channels,
-        augment=use_augmentation,
-    )
+    if dataset is None:
+        raise ValueError("train_with_validation requires a real dataset instance.")
     val_size = max(1, int(len(dataset) * val_ratio))
     train_size = len(dataset) - val_size
 
@@ -193,12 +198,19 @@ def train_with_validation(
     fg_fraction = estimate_foreground_fraction(train_ds)
     auto_pos_weight = (1.0 - fg_fraction) / max(fg_fraction, 1e-6)
     use_pos_weight = auto_pos_weight if pos_weight is None else pos_weight
-    criterion = SegmentationLoss(mode=loss_mode, dice_lambda=dice_lambda, pos_weight=use_pos_weight).to(device)
+    criterion = SegmentationLoss(
+        mode=loss_mode,
+        dice_lambda=dice_lambda,
+        pos_weight=use_pos_weight,
+        use_border_weights=use_border_weights,
+        border_w0=border_w0,
+        border_sigma=border_sigma,
+    ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     print(
-        f"[Train] samples={num_samples}, split={train_size}/{val_size}, "
-        f"batch={batch_size}, epochs={epochs}, lr={lr}, augment={use_augmentation}, "
+        f"[Train] samples={len(dataset)}, split={train_size}/{val_size}, "
+        f"batch={batch_size}, epochs={epochs}, lr={lr}, "
         f"loss_mode={loss_mode}, dice_lambda={dice_lambda}, "
         f"fg_fraction={fg_fraction:.4f}, pos_weight={use_pos_weight:.2f}"
     )
@@ -220,3 +232,78 @@ def train_with_validation(
                 sample_masks = sample_masks.to(device)
                 sample_logits = model(sample_images)
                 save_visual_panel(sample_images, sample_masks, sample_logits, vis_dir, epoch, prefix="val")
+
+
+def _tile_positions(length: int, step: int) -> list[int]:
+    if length <= step:
+        return [0]
+    positions = list(range(0, length - step + 1, step))
+    if positions[-1] != length - step:
+        positions.append(length - step)
+    return positions
+
+
+def overlap_tile_inference(
+    model: torch.nn.Module,
+    image: torch.Tensor,
+    tile_size: int = 572,
+) -> torch.Tensor:
+    model.eval()
+    device = next(model.parameters()).device
+    image = image.to(device)
+
+    if image.ndim == 3:
+        image = image.unsqueeze(0)
+    if image.ndim != 4 or image.shape[0] != 1:
+        raise ValueError("overlap_tile_inference expects a single image tensor with shape [C,H,W] or [1,C,H,W]")
+
+    with torch.no_grad():
+        dummy = torch.zeros(1, image.shape[1], tile_size, tile_size, device=device, dtype=image.dtype)
+        out_dummy = model(dummy)
+
+    out_tile = int(out_dummy.shape[2])
+    if out_tile <= 0:
+        raise ValueError("Model returned invalid tile output size during overlap-tile setup.")
+    margin = (tile_size - out_tile) // 2
+
+    _, _, h, w = image.shape
+    padded = torch.nn.functional.pad(image, (margin, margin, margin, margin), mode="reflect")
+
+    y_positions = _tile_positions(h, out_tile)
+    x_positions = _tile_positions(w, out_tile)
+
+    stitched = torch.zeros(1, 1, h, w, device=device)
+    counts = torch.zeros(1, 1, h, w, device=device)
+
+    with torch.no_grad():
+        for y in y_positions:
+            for x in x_positions:
+                tile = padded[:, :, y : y + tile_size, x : x + tile_size]
+                logits_tile = model(tile)
+                stitched[:, :, y : y + out_tile, x : x + out_tile] += logits_tile
+                counts[:, :, y : y + out_tile, x : x + out_tile] += 1.0
+
+    stitched = stitched / counts.clamp_min(1.0)
+    return stitched.squeeze(0)
+
+
+def run_overlap_inference_on_dataset(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    save_dir: str,
+    tile_size: int = 572,
+    threshold: float = 0.5,
+) -> None:
+    from pathlib import Path
+    from PIL import Image
+
+    out_dir = Path(save_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    model.eval()
+    for images, names in loader:
+        image = images[0]
+        logits = overlap_tile_inference(model, image, tile_size=tile_size)
+        prob = torch.sigmoid(logits[0]).detach().cpu().numpy()
+        pred = (prob > threshold).astype("uint8") * 255
+        Image.fromarray(pred).save(out_dir / names[0].replace(".tif", "_pred.png"))
