@@ -1,7 +1,9 @@
 import csv
 from pathlib import Path
 
+import numpy as np
 import torch
+from scipy.ndimage import label
 from torch.utils.data import DataLoader, Dataset, Subset, random_split
 
 from losses import SegmentationLoss, dice_score_from_logits, iou_score_from_logits
@@ -288,6 +290,18 @@ def _tile_positions(length: int, step: int) -> list[int]:
     return positions
 
 
+def remove_small_components(mask: np.ndarray, min_size: int = 40) -> np.ndarray:
+    labeled, num = label(mask)
+    cleaned = np.zeros_like(mask, dtype=np.uint8)
+
+    for comp_id in range(1, num + 1):
+        comp = labeled == comp_id
+        if int(comp.sum()) >= min_size:
+            cleaned[comp] = 1
+
+    return cleaned
+
+
 def overlap_tile_inference(
     model: torch.nn.Module,
     image: torch.Tensor,
@@ -338,6 +352,7 @@ def run_overlap_inference_on_dataset(
     save_dir: str,
     tile_size: int = 572,
     threshold: float = 0.5,
+    min_size: int = 40,
     max_samples: int | None = None,
 ) -> None:
     from PIL import Image
@@ -351,11 +366,13 @@ def run_overlap_inference_on_dataset(
             break
         image = images[0]
         logits = overlap_tile_inference(model, image, tile_size=tile_size)
-        prob = torch.sigmoid(logits[0]).detach().cpu().numpy()
-        pred = (prob > threshold).astype("uint8") * 255
+        prob_np = torch.sigmoid(logits[0]).detach().cpu().numpy()
+        pred_np = (prob_np > threshold).astype(np.uint8)
+        pred_np = remove_small_components(pred_np, min_size=min_size)
+        pred_gray = pred_np.astype("uint8") * 255
         input_gray = (image[0].detach().cpu().clamp(0.0, 1.0).numpy() * 255.0).astype("uint8")
-        prob_gray = (prob * 255.0).astype("uint8")
+        prob_gray = (prob_np * 255.0).astype("uint8")
         stem = names[0].replace(".tif", "")
         Image.fromarray(input_gray).save(out_dir / f"{stem}_input.png")
         Image.fromarray(prob_gray).save(out_dir / f"{stem}_prob.png")
-        Image.fromarray(pred).save(out_dir / f"{stem}_pred.png")
+        Image.fromarray(pred_gray).save(out_dir / f"{stem}_pred.png")

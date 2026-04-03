@@ -7,6 +7,28 @@ from torch.utils.data import DataLoader
 from dataset import RealCTCSegmentationDataset, RealCTCTestDataset
 from model import UNet, validate_unet_input_size
 from train import run_overfit_sanity_check, run_overlap_inference_on_dataset, train_with_validation
+from visualize import plot_overfit_metrics, plot_train_metrics
+
+
+def build_run_name(mode: str, epochs: int, lr: float, dice_lambda: float) -> str:
+    return (
+        f"mode_{mode}_epochs_{epochs}_"
+        f"train-lr_{lr:g}_dice-lambda_{dice_lambda:g}"
+    )
+
+
+def build_artifact_run_dir(root: str, mode: str, epochs: int, lr: float, dice_lambda: float) -> str:
+    run_name = (
+        build_run_name(
+            mode=mode,
+            epochs=epochs,
+            lr=lr,
+            dice_lambda=dice_lambda,
+        )
+    )
+    run_dir = os.path.join(root, run_name)
+    os.makedirs(run_dir, exist_ok=True)
+    return run_dir
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -58,14 +80,13 @@ def main() -> None:
     os.makedirs(args.vis_dir, exist_ok=True)
     metrics_dir = os.path.join(args.vis_dir, "metrics")
     checkpoints_dir = os.path.join(args.vis_dir, "checkpoints")
-    train_metrics_csv = os.path.join(metrics_dir, "train_metrics.csv")
-    overfit_metrics_csv = os.path.join(metrics_dir, "overfit_metrics.csv")
-    best_ckpt_path = os.path.join(checkpoints_dir, "best_val_dice.pt")
-
-    # Avoid appending stale rows when starting a fresh run.
-    for metrics_file in (train_metrics_csv, overfit_metrics_csv):
-        if os.path.exists(metrics_file):
-            os.remove(metrics_file)
+    train_run_name = build_run_name(
+        mode="train",
+        epochs=args.train_epochs,
+        lr=args.train_lr,
+        dice_lambda=args.dice_lambda,
+    )
+    best_ckpt_path = os.path.join(checkpoints_dir, train_run_name, "best_val_dice.pt")
 
     sequences = tuple(seq.strip() for seq in args.sequences.split(",") if seq.strip())
     train_dataset = None
@@ -84,6 +105,17 @@ def main() -> None:
         print(f"[Trace] output spatial size: {y.shape[2]}x{y.shape[3]}")
 
     if args.mode in ("overfit", "all"):
+        overfit_metrics_dir = build_artifact_run_dir(
+            root=metrics_dir,
+            mode="overfit",
+            epochs=args.overfit_epochs,
+            lr=args.overfit_lr,
+            dice_lambda=args.dice_lambda,
+        )
+        overfit_metrics_csv = os.path.join(overfit_metrics_dir, "overfit_metrics.csv")
+        # Avoid appending stale rows only when overfit metrics are being generated.
+        if os.path.exists(overfit_metrics_csv):
+            os.remove(overfit_metrics_csv)
         if train_dataset is None:
             train_dataset = RealCTCSegmentationDataset(
                 root_dir=args.data_root,
@@ -120,8 +152,29 @@ def main() -> None:
             metrics_csv_path=overfit_metrics_csv,
             dataset=train_dataset,
         )
+        plot_overfit_metrics(overfit_metrics_csv)
+        print(f"[Overfit] Metrics saved under {overfit_metrics_dir}")
 
     if args.mode in ("train", "all"):
+        train_metrics_dir = build_artifact_run_dir(
+            root=metrics_dir,
+            mode="train",
+            epochs=args.train_epochs,
+            lr=args.train_lr,
+            dice_lambda=args.dice_lambda,
+        )
+        train_metrics_csv = os.path.join(train_metrics_dir, "train_metrics.csv")
+        train_ckpt_dir = build_artifact_run_dir(
+            root=checkpoints_dir,
+            mode="train",
+            epochs=args.train_epochs,
+            lr=args.train_lr,
+            dice_lambda=args.dice_lambda,
+        )
+        best_ckpt_path = os.path.join(train_ckpt_dir, "best_val_dice.pt")
+        # Avoid appending stale rows only when train metrics are being generated.
+        if os.path.exists(train_metrics_csv):
+            os.remove(train_metrics_csv)
         if train_dataset is None:
             train_dataset = RealCTCSegmentationDataset(
                 root_dir=args.data_root,
@@ -159,16 +212,32 @@ def main() -> None:
             checkpoint_path=best_ckpt_path,
             dataset=train_dataset,
         )
+        plot_train_metrics(train_metrics_csv)
+        print(f"[Train] Metrics saved under {train_metrics_dir}")
+        print(f"[Train] Checkpoint saved under {best_ckpt_path}")
 
     if args.mode in ("infer", "all"):
+        infer_dir = build_artifact_run_dir(
+            root=os.path.join(args.vis_dir, "infer"),
+            mode="infer",
+            epochs=args.train_epochs,
+            lr=args.train_lr,
+            dice_lambda=args.dice_lambda,
+        )
         model = UNet(in_channels=3, num_classes=1).to(device)
         ckpt_path = args.checkpoint
-        if ckpt_path is None and os.path.exists(best_ckpt_path):
-            ckpt_path = best_ckpt_path
+        if ckpt_path is None:
+            candidate_ckpt = os.path.join(checkpoints_dir, train_run_name, "best_val_dice.pt")
+            if os.path.exists(candidate_ckpt):
+                ckpt_path = candidate_ckpt
+            elif os.path.exists(best_ckpt_path):
+                ckpt_path = best_ckpt_path
         if ckpt_path:
             state = torch.load(ckpt_path, map_location=device)
             model.load_state_dict(state)
             print(f"[Infer] Loaded checkpoint: {ckpt_path}")
+        else:
+            print("[Infer] No checkpoint found; running with randomly initialized weights.")
         test_dataset = RealCTCTestDataset(
             root_dir=args.data_root,
             dataset_name=args.dataset_name,
@@ -179,12 +248,12 @@ def main() -> None:
         run_overlap_inference_on_dataset(
             model=model,
             loader=test_loader,
-            save_dir=os.path.join(args.vis_dir, "infer"),
+            save_dir=infer_dir,
             tile_size=args.tile_size,
             threshold=0.5,
             max_samples=max(1, args.infer_max_samples),
         )
-        print(f"[Infer] Saved tiled predictions to {os.path.join(args.vis_dir, 'infer')}")
+        print(f"[Infer] Saved tiled predictions to {infer_dir}")
 
 
 if __name__ == "__main__":
