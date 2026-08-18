@@ -1,0 +1,98 @@
+======================================================================
+CORRUPTION ROBUSTNESS ANALYSIS REPORT
+======================================================================
+
+1. SUMMARY STATISTICS
+----------------------------------------------------------------------
+
+efficientnet_b0
+  Clean Accuracy: 0.9307
+  Parameters: 4.00M
+  GFLOPs: 0.77
+  Avg Relative Robustness: 0.7094
+
+resnet50
+  Clean Accuracy: 0.9342
+  Parameters: 23.57M
+  GFLOPs: 8.26
+  Avg Relative Robustness: 0.8369
+
+inception_v3
+  Clean Accuracy: 0.8542
+  Parameters: 21.81M
+  GFLOPs: 11.42
+  Avg Relative Robustness: 0.7264
+
+2. MODEL RANKINGS
+----------------------------------------------------------------------
+
+Ranking by Clean Accuracy:
+1. resnet50 (0.9342)
+2. efficientnet_b0 (0.9307)
+3. inception_v3 (0.8542)
+
+Ranking by Robustness:
+1. resnet50 (0.8369)
+2. inception_v3 (0.7264)
+3. efficientnet_b0 (0.7094)
+
+3. ROBUSTNESS PER CORRUPTION
+----------------------------------------------------------------------
+
+Gaussian_0.05
+  Best Model: resnet50 (0.9278)
+  Worst Model: inception_v3 (0.8399)
+
+Gaussian_0.1
+  Best Model: resnet50 (0.8771)
+  Worst Model: inception_v3 (0.7212)
+
+Gaussian_0.2
+  Best Model: resnet50 (0.6969)
+  Worst Model: efficientnet_b0 (0.1680)
+
+MotionBlur
+  Best Model: efficientnet_b0 (0.5754)
+  Worst Model: inception_v3 (0.3517)
+
+BrightnessShift
+  Best Model: efficientnet_b0 (0.9049)
+  Worst Model: inception_v3 (0.8149)
+
+4. CORRUPTION DIFFICULTY
+----------------------------------------------------------------------
+
+Hardest Corruption: Gaussian_0.2 (0.4132)
+Easiest Corruption: Gaussian_0.05 (0.8892)
+
+5. EFFICIENCY ANALYSIS
+----------------------------------------------------------------------
+
+efficientnet_b0
+  Parameters: 4.00M
+  GFLOPs: 0.77
+
+resnet50
+  Parameters: 23.57M
+  GFLOPs: 8.26
+
+inception_v3
+  Parameters: 21.81M
+  GFLOPs: 11.42
+
+Most Efficient Model: efficientnet_b0
+
+6. RECOMMENDATIONS
+----------------------------------------------------------------------
+
+For noisy environments: use resnet50
+For motion blur scenarios (moving cameras / moving objects): use efficientnet_b0
+For illumination variations (brightness changes): use efficientnet_b0
+Most memory efficient: use efficientnet_b0
+Most compute efficient: use efficientnet_b0
+For balanced performance across all corruptions: use resnet50
+
+
+======================================================================
+END OF REPORT
+======================================================================
